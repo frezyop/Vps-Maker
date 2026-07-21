@@ -18,7 +18,7 @@ function setup_vds() {
     echo -e "${YELLOW}Setting up VDS Dependencies...${NC}"
     sudo apt-get update -y
     # Added cloud-image-utils for superfast Cloud-Init ISO generation
-    sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst libguestfs-tools cloud-image-utils wget curl
+    sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst libguestfs-tools cloud-image-utils wget curl iptables
     sudo systemctl enable --now libvirtd
     
     # Start default network if not active
@@ -158,7 +158,6 @@ function manage_vps() {
         3) echo -e "${RED}Reinstall feature coming soon (Requires deleting and recreating).${NC}" ;;
         4) 
            read -p "Enter new root password: " new_pass
-           # Updating password via GuestFS (fast and reliable)
            virsh destroy "$selected_vps" 2>/dev/null
            guestfish --rw -a "/var/lib/libvirt/images/${selected_vps}.qcow2" -i <<EOF
            string-write /etc/shadow "root:\$6\$rounds=50000\$(openssl rand -base64 8)\$$(openssl passwd -6 "$new_pass" | cut -d'$' -f4):19000:0:99999:7:::"
@@ -186,7 +185,7 @@ function connect_vps() {
     MAC=$(virsh domiflist "$selected_vps" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
     vps_ip=""
     
-    # Loop to check for IP every 2 seconds
+    # Loop to check for IP
     for i in {1..15}; do
         vps_ip=$(virsh net-dhcp-leases default | grep -i "$MAC" | awk '{print $5}' | cut -d/ -f1 | head -n 1)
         if [ -n "$vps_ip" ]; then
@@ -201,6 +200,9 @@ function connect_vps() {
     
     if [ -z "$vps_ip" ]; then
         vps_ip="Failed to fetch IP. Please check if VPS is running."
+        echo -e "${RED}$vps_ip${NC}"
+        read -p "Press Enter to return..."
+        return
     fi
 
     # Read the auto-generated port
@@ -210,13 +212,25 @@ function connect_vps() {
         saved_port="22"
     fi
 
+    # Get VDS Main Public IP
+    main_vds_ip=$(curl -s ifconfig.me)
+
+    # Automatically set up Port Forwarding (iptables NAT routing)
+    echo -e "${YELLOW}Setting up network routing...${NC}"
+    sudo iptables -t nat -C PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:$saved_port" 2>/dev/null || \
+    sudo iptables -t nat -I PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:$saved_port"
+    
+    sudo iptables -C FORWARD -p tcp -d "$vps_ip" --dport "$saved_port" -j ACCEPT 2>/dev/null || \
+    sudo iptables -I FORWARD -p tcp -d "$vps_ip" --dport "$saved_port" -j ACCEPT
+
     echo -e "${GREEN}==============================${NC}"
     echo -e "Connection Details for Termius:"
     echo -e "VPS Name : ${CYAN}$selected_vps${NC}"
-    echo -e "IP       : ${CYAN}$vps_ip${NC}"
+    echo -e "Host IP  : ${GREEN}$main_vds_ip${NC} (Use this in Termius)"
+    echo -e "Local IP : ${CYAN}$vps_ip${NC} (Internal Network)"
     echo -e "Username : ${CYAN}root${NC}"
     echo -e "Password : ${CYAN}[The password you set during creation]${NC}"
-    echo -e "Port     : ${CYAN}$saved_port${NC}"
+    echo -e "Port     : ${GREEN}$saved_port${NC}"
     echo -e "${GREEN}==============================${NC}"
     read -p "Press Enter to return to menu..."
 }
@@ -233,7 +247,18 @@ function delete_vps() {
     
     read -p "By typing 'y' you confirm that you want to delete your VPS '$selected_vps': " confirm
     if [ "$confirm" == "y" ] || [ "$confirm" == "Y" ]; then
-        echo -e "${RED}Deleting VPS and cleaning up files...${NC}"
+        echo -e "${RED}Deleting VPS and cleaning up files/networks...${NC}"
+        
+        # Clean up iptables port forwarding rules before destroying
+        if [ -f "/var/lib/libvirt/images/${selected_vps}.port" ]; then
+            saved_port=$(cat "/var/lib/libvirt/images/${selected_vps}.port")
+            vps_ip=$(virsh domifaddr "$selected_vps" --source arp 2>/dev/null | awk 'NR>2 {print $4}' | cut -d/ -f1 | head -n 1)
+            if [ -n "$vps_ip" ] && [ -n "$saved_port" ]; then
+                sudo iptables -t nat -D PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:$saved_port" 2>/dev/null
+                sudo iptables -D FORWARD -p tcp -d "$vps_ip" --dport "$saved_port" -j ACCEPT 2>/dev/null
+            fi
+        fi
+
         virsh destroy "$selected_vps" >/dev/null 2>&1
         virsh undefine "$selected_vps" --remove-all-storage >/dev/null 2>&1
         rm -f "/var/lib/libvirt/images/${selected_vps}.port"
