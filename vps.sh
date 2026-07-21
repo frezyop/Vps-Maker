@@ -17,7 +17,6 @@ function show_header() {
 function setup_vds() {
     echo -e "${YELLOW}Setting up VDS Dependencies...${NC}"
     sudo apt-get update -y
-    # Added cloud-image-utils for superfast Cloud-Init ISO generation
     sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst libguestfs-tools cloud-image-utils wget curl iptables
     sudo systemctl enable --now libvirtd
     
@@ -25,7 +24,10 @@ function setup_vds() {
     sudo virsh net-start default >/dev/null 2>&1
     sudo virsh net-autostart default >/dev/null 2>&1
     
-    echo -e "${GREEN}Setup Complete! ✅ Dependencies are ready.${NC}"
+    # Enable IP Forwarding in Kernel (Crucial for routing traffic to VPS)
+    sudo sysctl -w net.ipv4.ip_forward=1
+    
+    echo -e "${GREEN}Setup Complete! ✅ Dependencies and Routing are ready.${NC}"
     read -p "Press Enter to return to menu..."
 }
 
@@ -50,9 +52,9 @@ function create_vps() {
     read -p "CPU (Cores, e.g., 2): " vps_cpu
     read -p "SSD (in GB, e.g., 20): " vps_ssd
     
-    # Auto-generate a safe random SSH port between 10000 and 50000
+    # Auto-generate a safe random External SSH port
     vps_port=$(shuf -i 10000-50000 -n 1)
-    echo -e "${GREEN}Auto-generated SSH Port: $vps_port${NC}"
+    echo -e "${GREEN}Auto-generated External SSH Port: $vps_port${NC}"
 
     echo "Select Software:"
     echo "1. Ubuntu 22.04"
@@ -67,7 +69,7 @@ function create_vps() {
         image_url="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
     fi
 
-    echo -e "${YELLOW}Downloading Base OS Image (if not exists)...${NC}"
+    echo -e "${YELLOW}Downloading Base OS Image...${NC}"
     mkdir -p /var/lib/libvirt/images/base
     base_image="/var/lib/libvirt/images/base/base_os.qcow2"
     if [ ! -f "$base_image" ]; then
@@ -78,19 +80,19 @@ function create_vps() {
     vps_disk="/var/lib/libvirt/images/${vps_name}.qcow2"
     qemu-img create -f qcow2 -b "$base_image" -F qcow2 "$vps_disk" "${vps_ssd}G"
     
-    # Save port locally for the Connect Menu
+    # Save External Port locally for the Connect Menu
     echo "$vps_port" > "/var/lib/libvirt/images/${vps_name}.port"
     
-    echo -e "${YELLOW}Generating Cloud-Init Network & Config ISO (Superfast Method)...${NC}"
+    echo -e "${YELLOW}Generating Cloud-Init (Superfast)...${NC}"
     cd /tmp
     
-    # Create Meta Data
     cat > meta-data <<EOF
 instance-id: $vps_name
 local-hostname: $vps_name
 EOF
 
-    # Create User Data (Injects password and sets auto-generated port)
+    # User Data: Sets password and enables root login. 
+    # Notice we DO NOT change the port here, it stays 22 internally!
     cat > user-data <<EOF
 #cloud-config
 password: $vps_pass
@@ -98,12 +100,9 @@ chpasswd: { expire: False }
 ssh_pwauth: True
 runcmd:
   - sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
-  - grep -q "^Port " /etc/ssh/sshd_config || echo "Port $vps_port" >> /etc/ssh/sshd_config
-  - sed -i 's/^Port 22.*/Port $vps_port/g' /etc/ssh/sshd_config
   - systemctl restart ssh || systemctl restart sshd
 EOF
 
-    # Create Network Data (Forces DHCP on all interfaces)
     cat > network-config <<EOF
 version: 2
 ethernets:
@@ -113,7 +112,6 @@ ethernets:
     dhcp4: true
 EOF
 
-    # Build the Seed ISO
     seed_iso="/var/lib/libvirt/images/${vps_name}-seed.iso"
     cloud-localds --network-config network-config "$seed_iso" user-data meta-data
     rm -f meta-data user-data network-config
@@ -131,7 +129,6 @@ EOF
         --noautoconsole
 
     echo -e "${GREEN}Done ✅ VPS '$vps_name' created instantly!${NC}"
-    echo -e "${GREEN}SSH Port assigned: $vps_port${NC}"
     read -p "Press Enter to return to menu..."
 }
 
@@ -142,21 +139,18 @@ function manage_vps() {
     
     read -p "Select VPS by typing number: " vps_num
     selected_vps="${vps_list[$((vps_num-1))]}"
-    
     if [ -z "$selected_vps" ]; then echo -e "${RED}Invalid selection.${NC}"; sleep 1; return; fi
     
     echo -e "${CYAN}Managing: $selected_vps${NC}"
     echo "1. Start"
     echo "2. Restart"
-    echo "3. Reinstall (Coming Soon)"
-    echo "4. Change Password (Requires Restart)"
+    echo "3. Change Password"
     read -p "Choose option: " m_opt
     
     case $m_opt in
         1) virsh start "$selected_vps" ;;
         2) virsh reboot "$selected_vps" ;;
-        3) echo -e "${RED}Reinstall feature coming soon (Requires deleting and recreating).${NC}" ;;
-        4) 
+        3) 
            read -p "Enter new root password: " new_pass
            virsh destroy "$selected_vps" 2>/dev/null
            guestfish --rw -a "/var/lib/libvirt/images/${selected_vps}.qcow2" -i <<EOF
@@ -177,20 +171,15 @@ function connect_vps() {
     
     read -p "Select VPS by typing number: " vps_num
     selected_vps="${vps_list[$((vps_num-1))]}"
-    
     if [ -z "$selected_vps" ]; then echo -e "${RED}Invalid selection.${NC}"; sleep 1; return; fi
 
-    echo -e "${YELLOW}Fetching IP address... (Waiting up to 30 seconds for Cloud-Init)${NC}"
-    
+    echo -e "${YELLOW}Fetching IP address...${NC}"
     MAC=$(virsh domiflist "$selected_vps" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
     vps_ip=""
     
-    # Loop to check for IP
     for i in {1..15}; do
         vps_ip=$(virsh net-dhcp-leases default | grep -i "$MAC" | awk '{print $5}' | cut -d/ -f1 | head -n 1)
-        if [ -n "$vps_ip" ]; then
-            break
-        fi
+        if [ -n "$vps_ip" ]; then break; fi
         sleep 2
     done
 
@@ -199,38 +188,33 @@ function connect_vps() {
     fi
     
     if [ -z "$vps_ip" ]; then
-        vps_ip="Failed to fetch IP. Please check if VPS is running."
-        echo -e "${RED}$vps_ip${NC}"
+        echo -e "${RED}Failed to fetch IP. Is VPS running?${NC}"
         read -p "Press Enter to return..."
         return
     fi
 
-    # Read the auto-generated port
     if [ -f "/var/lib/libvirt/images/${selected_vps}.port" ]; then
         saved_port=$(cat "/var/lib/libvirt/images/${selected_vps}.port")
     else
         saved_port="22"
     fi
 
-    # Get VDS Main Public IP
     main_vds_ip=$(curl -s ifconfig.me)
 
-    # Automatically set up Port Forwarding (iptables NAT routing)
-    echo -e "${YELLOW}Setting up network routing...${NC}"
-    sudo iptables -t nat -C PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:$saved_port" 2>/dev/null || \
-    sudo iptables -t nat -I PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:$saved_port"
+    # Smart Port Forwarding -> Forwards External Port to Internal Port 22
+    echo -e "${YELLOW}Setting up network routing (External $saved_port -> Internal 22)...${NC}"
+    sudo iptables -t nat -C PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:22" 2>/dev/null || \
+    sudo iptables -t nat -I PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:22"
     
-    sudo iptables -C FORWARD -p tcp -d "$vps_ip" --dport "$saved_port" -j ACCEPT 2>/dev/null || \
-    sudo iptables -I FORWARD -p tcp -d "$vps_ip" --dport "$saved_port" -j ACCEPT
+    sudo iptables -C FORWARD -p tcp -d "$vps_ip" --dport 22 -j ACCEPT 2>/dev/null || \
+    sudo iptables -I FORWARD -p tcp -d "$vps_ip" --dport 22 -j ACCEPT
 
     echo -e "${GREEN}==============================${NC}"
     echo -e "Connection Details for Termius:"
-    echo -e "VPS Name : ${CYAN}$selected_vps${NC}"
-    echo -e "Host IP  : ${GREEN}$main_vds_ip${NC} (Use this in Termius)"
-    echo -e "Local IP : ${CYAN}$vps_ip${NC} (Internal Network)"
-    echo -e "Username : ${CYAN}root${NC}"
-    echo -e "Password : ${CYAN}[The password you set during creation]${NC}"
+    echo -e "Host IP  : ${GREEN}$main_vds_ip${NC}"
     echo -e "Port     : ${GREEN}$saved_port${NC}"
+    echo -e "Username : ${CYAN}root${NC}"
+    echo -e "Password : ${CYAN}[The password you set]${NC}"
     echo -e "${GREEN}==============================${NC}"
     read -p "Press Enter to return to menu..."
 }
@@ -243,19 +227,16 @@ function delete_vps() {
     read -p "Select VPS by typing number: " vps_num
     selected_vps="${vps_list[$((vps_num-1))]}"
     
-    if [ -z "$selected_vps" ]; then echo -e "${RED}Invalid selection.${NC}"; sleep 1; return; fi
-    
-    read -p "By typing 'y' you confirm that you want to delete your VPS '$selected_vps': " confirm
-    if [ "$confirm" == "y" ] || [ "$confirm" == "Y" ]; then
-        echo -e "${RED}Deleting VPS and cleaning up files/networks...${NC}"
-        
-        # Clean up iptables port forwarding rules before destroying
+    read -p "Confirm delete '$selected_vps' (y/n): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${RED}Cleaning networks and deleting VPS...${NC}"
+        # Removing routing rules to keep VDS clean
         if [ -f "/var/lib/libvirt/images/${selected_vps}.port" ]; then
             saved_port=$(cat "/var/lib/libvirt/images/${selected_vps}.port")
             vps_ip=$(virsh domifaddr "$selected_vps" --source arp 2>/dev/null | awk 'NR>2 {print $4}' | cut -d/ -f1 | head -n 1)
             if [ -n "$vps_ip" ] && [ -n "$saved_port" ]; then
-                sudo iptables -t nat -D PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:$saved_port" 2>/dev/null
-                sudo iptables -D FORWARD -p tcp -d "$vps_ip" --dport "$saved_port" -j ACCEPT 2>/dev/null
+                sudo iptables -t nat -D PREROUTING -p tcp --dport "$saved_port" -j DNAT --to-destination "$vps_ip:22" 2>/dev/null
+                sudo iptables -D FORWARD -p tcp -d "$vps_ip" --dport 22 -j ACCEPT 2>/dev/null
             fi
         fi
 
@@ -264,8 +245,6 @@ function delete_vps() {
         rm -f "/var/lib/libvirt/images/${selected_vps}.port"
         rm -f "/var/lib/libvirt/images/${selected_vps}-seed.iso"
         echo -e "${GREEN}VPS deleted successfully!${NC}"
-    else
-        echo "Deletion cancelled."
     fi
     read -p "Press Enter to return..."
 }
@@ -287,7 +266,7 @@ while true; do
         3) connect_vps ;;
         4) delete_vps ;;
         5) setup_vds ;;
-        0) echo "Exiting..."; exit 0 ;;
-        *) echo -e "${RED}Invalid choice!${NC}"; sleep 1 ;;
+        0) exit 0 ;;
+        *) echo "Invalid"; sleep 1 ;;
     esac
 done
