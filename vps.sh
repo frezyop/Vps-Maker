@@ -91,15 +91,19 @@ instance-id: $vps_name
 local-hostname: $vps_name
 EOF
 
-    # User Data: Sets password and enables root login. 
-    # Notice we DO NOT change the port here, it stays 22 internally!
+    # PERMANENT FIX: Explicitly disable_root: false and remove the hidden drop-in file
     cat > user-data <<EOF
 #cloud-config
-password: $vps_pass
-chpasswd: { expire: False }
-ssh_pwauth: True
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  list: |
+    root:$vps_pass
+  expire: false
 runcmd:
-  - sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+  - rm -f /etc/ssh/sshd_config.d/*.conf
+  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+  - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
   - systemctl restart ssh || systemctl restart sshd
 EOF
 
