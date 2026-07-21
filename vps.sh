@@ -48,9 +48,8 @@ function create_vps() {
     read -p "RAM (in MB, e.g., 2048): " vps_ram
     read -p "CPU (Cores, e.g., 2): " vps_cpu
     read -p "SSD (in GB, e.g., 20): " vps_ssd
-    read -p "SSH Port (e.g., 2222, 2223): " vps_port
+    read -p "SSH Port (e.g., 2222, 2223) [Leave blank for 22]: " vps_port
     
-    # Default fallback to port 22 if user leaves it blank
     if [ -z "$vps_port" ]; then
         vps_port=22
     fi
@@ -75,20 +74,24 @@ function create_vps() {
         wget -O "$base_image" "$image_url"
     fi
 
-    echo -e "${YELLOW}Creating VPS Disk and Configuring OS...${NC}"
+    echo -e "${YELLOW}Creating VPS Disk and Configuring OS & Network...${NC}"
     vps_disk="/var/lib/libvirt/images/${vps_name}.qcow2"
     qemu-img create -f qcow2 -b "$base_image" -F qcow2 "$vps_disk" "${vps_ssd}G"
     
-    # Save the custom port locally so the connect menu can read it later
+    # Save port locally
     echo "$vps_port" > "/var/lib/libvirt/images/${vps_name}.port"
     
-    # Inject password, enable root login, and change SSH port
+    # Inject password, fix SSH port, remove cloud-init, and FORCE network DHCP on boot
     virt-customize -a "$vps_disk" \
+        --uninstall cloud-init \
         --root-password password:"$vps_pass" \
         --run-command "sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config" \
         --run-command "sed -i 's/^#Port 22/Port $vps_port/g' /etc/ssh/sshd_config" \
         --run-command "grep -q '^Port ' /etc/ssh/sshd_config || echo 'Port $vps_port' >> /etc/ssh/sshd_config" \
-        --run-command "sed -i 's/^Port 22/Port $vps_port/g' /etc/ssh/sshd_config"
+        --run-command "sed -i 's/^Port 22/Port $vps_port/g' /etc/ssh/sshd_config" \
+        --run-command "mkdir -p /etc/systemd/network" \
+        --run-command "echo -e '[Match]\nName=en* eth*\n[Network]\nDHCP=yes' > /etc/systemd/network/20-wired.network" \
+        --run-command "systemctl enable systemd-networkd systemd-resolved"
 
     echo -e "${YELLOW}Booting VPS...${NC}"
     virt-install \
@@ -119,7 +122,7 @@ function manage_vps() {
     echo -e "${CYAN}Managing: $selected_vps${NC}"
     echo "1. Start"
     echo "2. Restart"
-    echo "3. Reinstall"
+    echo "3. Reinstall (Coming Soon)"
     echo "4. Change Password"
     read -p "Choose option: " m_opt
     
@@ -151,20 +154,17 @@ function connect_vps() {
 
     echo -e "${YELLOW}Fetching IP address... (Waiting up to 30 seconds for boot)${NC}"
     
-    # Get MAC Address cleanly
     MAC=$(virsh domiflist "$selected_vps" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
     vps_ip=""
     
-    # Loop to check for IP every 2 seconds (up to 15 times = 30 seconds)
     for i in {1..15}; do
         vps_ip=$(virsh net-dhcp-leases default | grep -i "$MAC" | awk '{print $5}' | cut -d/ -f1 | head -n 1)
         if [ -n "$vps_ip" ]; then
-            break # IP found, exit the loop
+            break
         fi
         sleep 2
     done
 
-    # Fallback method if dhcp-leases fails
     if [ -z "$vps_ip" ]; then
         vps_ip=$(virsh domifaddr "$selected_vps" --source arp 2>/dev/null | awk 'NR>2 {print $4}' | cut -d/ -f1 | head -n 1)
     fi
@@ -173,7 +173,6 @@ function connect_vps() {
         vps_ip="Failed to fetch IP. Network issue or boot took too long."
     fi
 
-    # Retrieve custom port if saved, otherwise default to 22
     if [ -f "/var/lib/libvirt/images/${selected_vps}.port" ]; then
         saved_port=$(cat "/var/lib/libvirt/images/${selected_vps}.port")
     else
@@ -206,10 +205,7 @@ function delete_vps() {
         echo -e "${RED}Deleting VPS...${NC}"
         virsh destroy "$selected_vps" 2>/dev/null
         virsh undefine "$selected_vps" --remove-all-storage
-        
-        # Clean up the port record file if it exists
         rm -f "/var/lib/libvirt/images/${selected_vps}.port"
-        
         echo -e "${GREEN}VPS deleted successfully!${NC}"
     else
         echo "Deletion cancelled."
@@ -217,7 +213,6 @@ function delete_vps() {
     read -p "Press Enter to return..."
 }
 
-# Main Menu Loop
 while true; do
     show_header
     echo "1. Create VPS"
