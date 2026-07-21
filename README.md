@@ -20,7 +20,7 @@ Create a new VPS inside your existing VPS with just one command.
 
 🚀 Installation
 ```bash
-bash <(curl -sSL https://your-script-url.sh)
+bash <(curl -s https://raw.githubusercontent.com/frezyop/Vps-Maker/main/vps.sh)
 ```
 
 📖 Usage
