@@ -91,7 +91,8 @@ instance-id: $vps_name
 local-hostname: $vps_name
 EOF
 
-    # PERMANENT FIX: Explicitly disable_root: false and remove the hidden drop-in file
+    # BULLETPROOF FIX: write_files creates a top-priority config override in sshd_config.d 
+    # to force root login and password authentication, bypassing all cloud image defaults.
     cat > user-data <<EOF
 #cloud-config
 disable_root: false
@@ -99,11 +100,14 @@ ssh_pwauth: true
 chpasswd:
   list: |
     root:$vps_pass
+    ubuntu:$vps_pass
   expire: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-custom.conf
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
 runcmd:
-  - rm -f /etc/ssh/sshd_config.d/*.conf
-  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
-  - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
   - systemctl restart ssh || systemctl restart sshd
 EOF
 
