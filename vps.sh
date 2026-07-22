@@ -22,7 +22,6 @@ pause() {
 
 # --- HELPER FUNCTION: SELECT VPS BY NUMBER ---
 select_vps() {
-    # Get list of containers into an array
     mapfile -t vps_array < <(lxc list -c n --format csv)
     
     if [ ${#vps_array[@]} -eq 0 ]; then
@@ -37,7 +36,6 @@ select_vps() {
     echo "--------------------------"
     read -p "Select VPS by number: " vps_num
     
-    # Validate input
     if ! [[ "$vps_num" =~ ^[0-9]+$ ]] || [ "$vps_num" -lt 1 ] || [ "$vps_num" -gt "${#vps_array[@]}" ]; then
         echo -e "${RED}[!] Invalid selection!${NC}"
         return 1
@@ -45,6 +43,19 @@ select_vps() {
     
     SELECTED_VPS="${vps_array[$((vps_num-1))]}"
     return 0
+}
+
+# --- HELPER FUNCTION: GENERATE RANDOM UNUSED PORT ---
+generate_random_port() {
+    while true; do
+        # Generate random port between 10000 and 65000
+        PORT=$(shuf -i 10000-65000 -n 1)
+        # Check if port is in use
+        if ! ss -tuln | grep -q ":$PORT\b" ; then
+            echo "$PORT"
+            break
+        fi
+    done
 }
 
 # 1. SETUP FUNCTION
@@ -70,10 +81,9 @@ create_vps() {
     read -p "Enter CPU Cores (e.g., 1, 2): " cpu_cores
     read -p "Enter SSD Storage in GB (e.g., 10, 20): " disk_gb
     echo -e "${YELLOW}--- Termius (SSH) Setup ---${NC}"
-    read -p "Enter External SSH Port (e.g., 2022, 2023): " ssh_port
     read -p "Enter Root Password for VPS: " root_pass
 
-    if [ -z "$vps_name" ] || [ -z "$ram_gb" ] || [ -z "$cpu_cores" ] || [ -z "$disk_gb" ] || [ -z "$ssh_port" ] || [ -z "$root_pass" ]; then
+    if [ -z "$vps_name" ] || [ -z "$ram_gb" ] || [ -z "$cpu_cores" ] || [ -z "$disk_gb" ] || [ -z "$root_pass" ]; then
         echo -e "${RED}[!] Error: All fields are required!${NC}"
         pause
         return
@@ -87,12 +97,14 @@ create_vps() {
     lxc config set "$vps_name" limits.cpu "$cpu_cores"
     lxc config device override "$vps_name" root size="${disk_gb}GB"
 
-    echo -e "${YELLOW}[*] Setting up SSH for Termius... (Please wait 10s)${NC}"
-    sleep 5 # Wait for network
+    echo -e "${YELLOW}[*] Setting up SSH for Termius (Instant setup)...${NC}"
+    sleep 3 # Just waiting 3 seconds for systemd to initialize inside container
     
-    # Configure SSH password and settings inside container
+    # Generate random port
+    ssh_port=$(generate_random_port)
+    
+    # Configure SSH password and settings (Skipped apt update to avoid lock hangs)
     lxc exec "$vps_name" -- bash -c "echo 'root:$root_pass' | chpasswd"
-    lxc exec "$vps_name" -- bash -c "apt-get update >/dev/null 2>&1 && apt-get install -y openssh-server >/dev/null 2>&1"
     lxc exec "$vps_name" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
     lxc exec "$vps_name" -- sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
     lxc exec "$vps_name" -- systemctl restart ssh
@@ -100,7 +112,8 @@ create_vps() {
     # Forward port from Host to Container
     lxc config device add "$vps_name" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22
 
-    echo -e "${GREEN}[+] VPS '$vps_name' created and ready for Termius! 🚀${NC}"
+    echo -e "${GREEN}[+] VPS '$vps_name' created successfully! 🚀${NC}"
+    echo -e "${CYAN}>> Assigned SSH Port: $ssh_port ${NC}"
     pause
 }
 
@@ -110,7 +123,7 @@ manage_vps() {
     select_vps || { pause; return; }
     
     echo "1. Edit Resources (RAM/CPU/SSD)"
-    echo "2. Setup/Reset Termius SSH (For Old VPS)"
+    echo "2. Setup/Reset Termius SSH (Generates New Random Port)"
     read -p "Select option [1-2]: " mng_opt
 
     if [ "$mng_opt" == "1" ]; then
@@ -127,16 +140,20 @@ manage_vps() {
         echo -e "${GREEN}[+] Resources updated for '$SELECTED_VPS'!${NC}"
         
     elif [ "$mng_opt" == "2" ]; then
-        read -p "Enter External SSH Port (e.g., 2022, 2023): " ssh_port
         read -p "Enter Root Password: " root_pass
         echo -e "${YELLOW}[*] Configuring SSH...${NC}"
+        
+        ssh_port=$(generate_random_port)
+        
         lxc exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
-        lxc exec "$SELECTED_VPS" -- bash -c "apt-get update >/dev/null 2>&1 && apt-get install -y openssh-server >/dev/null 2>&1"
         lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
         lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
         lxc exec "$SELECTED_VPS" -- systemctl restart ssh
+        
+        # Try adding device, if it exists, set the new port instead
         lxc config device add "$SELECTED_VPS" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22 2>/dev/null || lxc config device set "$SELECTED_VPS" ssh_proxy listen=tcp:0.0.0.0:$ssh_port
-        echo -e "${GREEN}[+] Termius SSH configured for '$SELECTED_VPS'!${NC}"
+        
+        echo -e "${GREEN}[+] Termius SSH configured! New Port: $ssh_port ${NC}"
     fi
     pause
 }
