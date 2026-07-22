@@ -106,8 +106,10 @@ create_vps() {
     echo -e "${YELLOW}[*] Setting up SSH & Removing Annoying UI Prompts...${NC}"
     sleep 3 
     
-    # Disable pink screen (needrestart)
+    # 1. Disable needrestart pink screen
     lxc exec "$vps_name" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
+    # 2. Silence dpkg config file conflicts (fixes the sshd_config pink screen)
+    lxc exec "$vps_name" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
     
     ssh_port=$(generate_random_port)
     
@@ -203,8 +205,10 @@ manage_vps() {
             echo -e "${YELLOW}[*] Configuring SSH & Removing UI Prompts...${NC}"
             sleep 3
             
-            # Disable pink screen (needrestart)
+            # 1. Disable needrestart pink screen
             lxc exec "$SELECTED_VPS" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
+            # 2. Silence dpkg config file conflicts (fixes the sshd_config pink screen)
+            lxc exec "$SELECTED_VPS" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
             
             lxc exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
             lxc exec "$SELECTED_VPS" -- rm -f /etc/ssh/sshd_config.d/*.conf
