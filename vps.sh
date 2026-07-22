@@ -20,6 +20,33 @@ pause() {
     read -p "Press [Enter] to return to the main menu..."
 }
 
+# --- HELPER FUNCTION: SELECT VPS BY NUMBER ---
+select_vps() {
+    # Get list of containers into an array
+    mapfile -t vps_array < <(lxc list -c n --format csv)
+    
+    if [ ${#vps_array[@]} -eq 0 ]; then
+        echo -e "${RED}[!] No Active VPS found!${NC}"
+        return 1
+    fi
+    
+    echo -e "${CYAN}--- Available VPS List ---${NC}"
+    for i in "${!vps_array[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${vps_array[$i]}"
+    done
+    echo "--------------------------"
+    read -p "Select VPS by number: " vps_num
+    
+    # Validate input
+    if ! [[ "$vps_num" =~ ^[0-9]+$ ]] || [ "$vps_num" -lt 1 ] || [ "$vps_num" -gt "${#vps_array[@]}" ]; then
+        echo -e "${RED}[!] Invalid selection!${NC}"
+        return 1
+    fi
+    
+    SELECTED_VPS="${vps_array[$((vps_num-1))]}"
+    return 0
+}
+
 # 1. SETUP FUNCTION
 setup_env() {
     echo -e "${YELLOW}[*] Setting up LXC/LXD Environment...${NC}"
@@ -41,8 +68,12 @@ create_vps() {
     read -p "Enter VPS Name: " vps_name
     read -p "Enter RAM in GB (e.g., 1, 2, 4): " ram_gb
     read -p "Enter CPU Cores (e.g., 1, 2): " cpu_cores
+    read -p "Enter SSD Storage in GB (e.g., 10, 20): " disk_gb
+    echo -e "${YELLOW}--- Termius (SSH) Setup ---${NC}"
+    read -p "Enter External SSH Port (e.g., 2022, 2023): " ssh_port
+    read -p "Enter Root Password for VPS: " root_pass
 
-    if [ -z "$vps_name" ] || [ -z "$ram_gb" ] || [ -z "$cpu_cores" ]; then
+    if [ -z "$vps_name" ] || [ -z "$ram_gb" ] || [ -z "$cpu_cores" ] || [ -z "$disk_gb" ] || [ -z "$ssh_port" ] || [ -z "$root_pass" ]; then
         echo -e "${RED}[!] Error: All fields are required!${NC}"
         pause
         return
@@ -51,56 +82,107 @@ create_vps() {
     echo -e "${YELLOW}[*] Launching Ubuntu 22.04 container...${NC}"
     lxc launch ubuntu:22.04 "$vps_name"
 
-    echo -e "${YELLOW}[*] Configuring resources (${ram_gb}GB RAM, ${cpu_cores} CPUs)...${NC}"
+    echo -e "${YELLOW}[*] Configuring resources...${NC}"
     lxc config set "$vps_name" limits.memory "${ram_gb}GB"
     lxc config set "$vps_name" limits.cpu "$cpu_cores"
+    lxc config device override "$vps_name" root size="${disk_gb}GB"
 
-    echo -e "${GREEN}[+] VPS '$vps_name' created successfully! 🚀${NC}"
+    echo -e "${YELLOW}[*] Setting up SSH for Termius... (Please wait 10s)${NC}"
+    sleep 5 # Wait for network
+    
+    # Configure SSH password and settings inside container
+    lxc exec "$vps_name" -- bash -c "echo 'root:$root_pass' | chpasswd"
+    lxc exec "$vps_name" -- bash -c "apt-get update >/dev/null 2>&1 && apt-get install -y openssh-server >/dev/null 2>&1"
+    lxc exec "$vps_name" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    lxc exec "$vps_name" -- sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    lxc exec "$vps_name" -- systemctl restart ssh
+
+    # Forward port from Host to Container
+    lxc config device add "$vps_name" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22
+
+    echo -e "${GREEN}[+] VPS '$vps_name' created and ready for Termius! 🚀${NC}"
     pause
 }
 
 # 3. MANAGE (EDIT RESOURCES) FUNCTION
 manage_vps() {
-    echo -e "${CYAN}--- Active VPS List ---${NC}"
-    lxc list
-    echo "-----------------------"
-    read -p "Enter VPS Name to edit resources: " vps_name
-    read -p "Enter new RAM in GB (e.g., 1, 2, 4): " new_ram
-    read -p "Enter new CPU Cores (e.g., 1, 2): " new_cpu
+    echo -e "${CYAN}--- Manage VPS ---${NC}"
+    select_vps || { pause; return; }
     
-    if [ -n "$new_ram" ]; then
-        lxc config set "$vps_name" limits.memory "${new_ram}GB"
+    echo "1. Edit Resources (RAM/CPU/SSD)"
+    echo "2. Setup/Reset Termius SSH (For Old VPS)"
+    read -p "Select option [1-2]: " mng_opt
+
+    if [ "$mng_opt" == "1" ]; then
+        echo -e "${YELLOW}(Leave blank and press Enter to keep current value)${NC}"
+        read -p "Enter new RAM in GB: " new_ram
+        read -p "Enter new CPU Cores: " new_cpu
+        read -p "Enter new SSD in GB: " new_disk
+        
+        if [ -n "$new_ram" ]; then lxc config set "$SELECTED_VPS" limits.memory "${new_ram}GB"; fi
+        if [ -n "$new_cpu" ]; then lxc config set "$SELECTED_VPS" limits.cpu "$new_cpu"; fi
+        if [ -n "$new_disk" ]; then
+            lxc config device set "$SELECTED_VPS" root size="${new_disk}GB" 2>/dev/null || lxc config device override "$SELECTED_VPS" root size="${new_disk}GB"
+        fi
+        echo -e "${GREEN}[+] Resources updated for '$SELECTED_VPS'!${NC}"
+        
+    elif [ "$mng_opt" == "2" ]; then
+        read -p "Enter External SSH Port (e.g., 2022, 2023): " ssh_port
+        read -p "Enter Root Password: " root_pass
+        echo -e "${YELLOW}[*] Configuring SSH...${NC}"
+        lxc exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
+        lxc exec "$SELECTED_VPS" -- bash -c "apt-get update >/dev/null 2>&1 && apt-get install -y openssh-server >/dev/null 2>&1"
+        lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        lxc exec "$SELECTED_VPS" -- systemctl restart ssh
+        lxc config device add "$SELECTED_VPS" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22 2>/dev/null || lxc config device set "$SELECTED_VPS" ssh_proxy listen=tcp:0.0.0.0:$ssh_port
+        echo -e "${GREEN}[+] Termius SSH configured for '$SELECTED_VPS'!${NC}"
     fi
-    if [ -n "$new_cpu" ]; then
-        lxc config set "$vps_name" limits.cpu "$new_cpu"
-    fi
-    
-    echo -e "${GREEN}[+] Resources updated successfully for '$vps_name'!${NC}"
     pause
 }
 
 # 4. CONNECT FUNCTION
 connect_vps() {
-    echo -e "${CYAN}--- Active VPS List ---${NC}"
-    lxc list
-    echo "-----------------------"
-    read -p "Enter VPS Name to connect: " vps_name
-    echo -e "${YELLOW}[*] Connecting to root@$vps_name... (Type 'exit' to leave)${NC}"
-    lxc exec "$vps_name" -- bash
-    pause
+    echo -e "${CYAN}--- Connect to VPS ---${NC}"
+    select_vps || { pause; return; }
+    
+    echo ""
+    echo -e "${YELLOW}How do you want to connect?${NC}"
+    echo "1. Get Termius Details (IP & Port)"
+    echo "2. Direct Console Connect (Auto-login)"
+    read -p "Select option [1-2]: " conn_opt
+
+    if [ "$conn_opt" == "1" ]; then
+        host_ip=$(curl -s ifconfig.me || echo "YOUR_SERVER_IP")
+        ssh_port=$(lxc config device get "$SELECTED_VPS" ssh_proxy listen 2>/dev/null | awk -F: '{print $NF}')
+        
+        echo -e "\n${GREEN}=== Termius Connection Details ===${NC}"
+        echo -e "Host IP  : ${CYAN}$host_ip${NC}"
+        if [ -n "$ssh_port" ]; then
+            echo -e "Port     : ${CYAN}$ssh_port${NC}"
+            echo -e "Username : ${CYAN}root${NC}"
+            echo -e "Password : ${CYAN}(The password you set)${NC}"
+        else
+            echo -e "${RED}[!] SSH Port not found! Use Manage -> Option 2 to setup SSH first.${NC}"
+        fi
+        echo "=================================="
+        pause
+    elif [ "$conn_opt" == "2" ]; then
+        echo -e "${YELLOW}[*] Connecting to root@$SELECTED_VPS... (Type 'exit' to leave)${NC}"
+        lxc exec "$SELECTED_VPS" -- bash
+        pause
+    fi
 }
 
 # 5. DELETE FUNCTION
 delete_vps() {
-    echo -e "${CYAN}--- Active VPS List ---${NC}"
-    lxc list
-    echo "-----------------------"
-    read -p "Enter VPS Name to delete: " vps_name
+    echo -e "${CYAN}--- Delete VPS ---${NC}"
+    select_vps || { pause; return; }
     
-    echo -e "${RED}[*] Stopping and deleting '$vps_name'...${NC}"
-    lxc stop "$vps_name" --force
-    lxc delete "$vps_name"
-    echo -e "${GREEN}[-] VPS '$vps_name' deleted completely.${NC}"
+    echo -e "${RED}[*] Stopping and deleting '$SELECTED_VPS'...${NC}"
+    lxc stop "$SELECTED_VPS" --force
+    lxc delete "$SELECTED_VPS"
+    echo -e "${GREEN}[-] VPS '$SELECTED_VPS' deleted completely.${NC}"
     pause
 }
 
@@ -118,8 +200,8 @@ while true; do
     echo -e "${YELLOW}=============================================${NC}"
     echo -e "  ${GREEN}1.${NC} Setup Environment"
     echo -e "  ${GREEN}2.${NC} Create VPS"
-    echo -e "  ${GREEN}3.${NC} Manage VPS (Edit Resources)"
-    echo -e "  ${GREEN}4.${NC} Connect VPS"
+    echo -e "  ${GREEN}3.${NC} Manage VPS (Edit Resources / Termius SSH)"
+    echo -e "  ${GREEN}4.${NC} Connect VPS (Terminal / Termius Info)"
     echo -e "  ${GREEN}5.${NC} Delete VPS"
     echo -e "  ${RED}6.${NC} Exit"
     echo -e "${YELLOW}=============================================${NC}"
