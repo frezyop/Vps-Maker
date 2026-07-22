@@ -103,10 +103,11 @@ create_vps() {
     # Generate random port
     ssh_port=$(generate_random_port)
     
-    # Configure SSH password and settings (Skipped apt update to avoid lock hangs)
+    # Configure SSH password and settings (Fixed Authentication issue)
     lxc exec "$vps_name" -- bash -c "echo 'root:$root_pass' | chpasswd"
-    lxc exec "$vps_name" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-    lxc exec "$vps_name" -- sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    lxc exec "$vps_name" -- bash -c "echo -e 'PasswordAuthentication yes\nPermitRootLogin yes' > /etc/ssh/sshd_config.d/99-custom-ssh.conf"
+    lxc exec "$vps_name" -- sed -i 's/^#*PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+    lxc exec "$vps_name" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
     lxc exec "$vps_name" -- systemctl restart ssh
 
     # Forward port from Host to Container
@@ -146,8 +147,9 @@ manage_vps() {
         ssh_port=$(generate_random_port)
         
         lxc exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
-        lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-        lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        lxc exec "$SELECTED_VPS" -- bash -c "echo -e 'PasswordAuthentication yes\nPermitRootLogin yes' > /etc/ssh/sshd_config.d/99-custom-ssh.conf"
+        lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+        lxc exec "$SELECTED_VPS" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
         lxc exec "$SELECTED_VPS" -- systemctl restart ssh
         
         # Try adding device, if it exists, set the new port instead
