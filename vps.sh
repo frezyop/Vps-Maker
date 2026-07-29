@@ -64,14 +64,16 @@ setup_env() {
         apt update && apt install -y snapd
         snap install lxd
         lxd init --auto
-        # Fix for "No root device could be found" error
-        lxc profile device add default root disk path=/ pool=default 2>/dev/null
         echo -e "${GREEN}[+] LXD installed and initialized successfully!${NC}"
     else
         echo -e "${GREEN}[+] LXD is already installed and ready!${NC}"
-        # Silently ensure the root device exists just in case
-        lxc profile device add default root disk path=/ pool=default 2>/dev/null
     fi
+
+    echo -e "${YELLOW}[*] Configuring Storage Pool & Root Device (Fixing 'Storage pool not found')...${NC}"
+    # Force create a dir-based storage pool named 'default' if it doesn't exist
+    lxc storage create default dir 2>/dev/null
+    # Attach it to the default profile
+    lxc profile device add default root disk path=/ pool=default 2>/dev/null
 
     echo -e "${YELLOW}[*] Applying Internet/Firewall forwarding rules...${NC}"
     iptables -I FORWARD -i lxdbr0 -j ACCEPT 2>/dev/null
@@ -79,7 +81,8 @@ setup_env() {
     lxc network set lxdbr0 ipv4.nat true 2>/dev/null
     sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw 2>/dev/null
     ufw reload >/dev/null 2>&1
-    echo -e "${GREEN}[+] Network configured for seamless internet access!${NC}"
+    
+    echo -e "${GREEN}[+] Network & Storage configured for seamless performance!${NC}"
     pause
 }
 
@@ -116,14 +119,14 @@ create_vps() {
     if [[ "$opt_priv" =~ ^[Yy]$ ]]; then
         if ! lxc launch ubuntu:22.04 "$vps_name" -c security.privileged=true -c security.nesting=true; then
             echo -e "${RED}[!] Critical Error: Failed to create VPS! Please check LXD storage pool.${NC}"
-            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first.${NC}"
+            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first to fix storage issues.${NC}"
             pause
             return
         fi
     else
         if ! lxc launch ubuntu:22.04 "$vps_name"; then
             echo -e "${RED}[!] Critical Error: Failed to create VPS! Please check LXD storage pool.${NC}"
-            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first.${NC}"
+            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first to fix storage issues.${NC}"
             pause
             return
         fi
