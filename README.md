@@ -18,9 +18,14 @@ Create a new VPS inside your existing VPS with just one command.
 - Root access
 - Virtualization support
 
-🚀 Installation
+# 🚀 Installation
+🖥️ LXC
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/frezyop/Vps-Maker/main/vps.sh)
+bash <(curl -s https://raw.githubusercontent.com/frezyop/Vps-Maker/main/lxc.sh)
+```
+🖥️ INCUS
+```bash
+bash <(curl -s https://raw.githubusercontent.com/frezyop/Vps-Maker/main/incus.sh)
 ```
 
 📖 Usage
