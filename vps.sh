@@ -64,9 +64,13 @@ setup_env() {
         apt update && apt install -y snapd
         snap install lxd
         lxd init --auto
+        # Fix for "No root device could be found" error
+        lxc profile device add default root disk path=/ pool=default 2>/dev/null
         echo -e "${GREEN}[+] LXD installed and initialized successfully!${NC}"
     else
         echo -e "${GREEN}[+] LXD is already installed and ready!${NC}"
+        # Silently ensure the root device exists just in case
+        lxc profile device add default root disk path=/ pool=default 2>/dev/null
     fi
 
     echo -e "${YELLOW}[*] Applying Internet/Firewall forwarding rules...${NC}"
@@ -86,17 +90,44 @@ create_vps() {
     read -p "Enter RAM in GB (e.g., 1, 2, 4): " ram_gb
     read -p "Enter CPU Cores (e.g., 1, 2): " cpu_cores
     read -p "Enter SSD Storage in GB (e.g., 10, 20): " disk_gb
-    echo -e "${YELLOW}--- Termius (SSH) Setup ---${NC}"
+    read -p "Enable Nesting & Privileged mode (for Docker)? (y/n): " opt_priv
+    
+    echo -e "${YELLOW}--- Termius (SSH) & Port Forwarding Setup ---${NC}"
     read -p "Enter Root Password for VPS: " root_pass
+    read -p "Enter SSH Port (Leave blank for random single port): " custom_port
+    read -p "Enter Extra Port Range to Forward (e.g., 14000-14100, or leave blank): " port_range
 
     if [ -z "$vps_name" ] || [ -z "$ram_gb" ] || [ -z "$cpu_cores" ] || [ -z "$disk_gb" ] || [ -z "$root_pass" ]; then
-        echo -e "${RED}[!] Error: All fields are required!${NC}"
+        echo -e "${RED}[!] Error: All required fields must be filled!${NC}"
         pause
         return
     fi
 
+    # Determine SSH Port
+    if [ -z "$custom_port" ]; then
+        ssh_port=$(generate_random_port)
+    else
+        ssh_port=$custom_port
+    fi
+
     echo -e "${YELLOW}[*] Launching Ubuntu 22.04 container...${NC}"
-    lxc launch ubuntu:22.04 "$vps_name"
+    
+    # Launch with or without Privileged/Nesting mode + Error Checking
+    if [[ "$opt_priv" =~ ^[Yy]$ ]]; then
+        if ! lxc launch ubuntu:22.04 "$vps_name" -c security.privileged=true -c security.nesting=true; then
+            echo -e "${RED}[!] Critical Error: Failed to create VPS! Please check LXD storage pool.${NC}"
+            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first.${NC}"
+            pause
+            return
+        fi
+    else
+        if ! lxc launch ubuntu:22.04 "$vps_name"; then
+            echo -e "${RED}[!] Critical Error: Failed to create VPS! Please check LXD storage pool.${NC}"
+            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first.${NC}"
+            pause
+            return
+        fi
+    fi
 
     echo -e "${YELLOW}[*] Configuring resources...${NC}"
     lxc config set "$vps_name" limits.memory "${ram_gb}GB"
@@ -106,12 +137,9 @@ create_vps() {
     echo -e "${YELLOW}[*] Setting up SSH & Removing Annoying UI Prompts...${NC}"
     sleep 3 
     
-    # 1. Disable needrestart pink screen
+    # Disable prompts
     lxc exec "$vps_name" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
-    # 2. Silence dpkg config file conflicts (fixes the sshd_config pink screen)
     lxc exec "$vps_name" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
-    
-    ssh_port=$(generate_random_port)
     
     lxc exec "$vps_name" -- bash -c "echo 'root:$root_pass' | chpasswd"
     lxc exec "$vps_name" -- rm -f /etc/ssh/sshd_config.d/*.conf
@@ -120,10 +148,18 @@ create_vps() {
     lxc exec "$vps_name" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
     lxc exec "$vps_name" -- systemctl restart ssh
 
+    # Add SSH Proxy Port
     lxc config device add "$vps_name" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22
 
+    # Add Extra Port Range if specified
+    if [ -n "$port_range" ]; then
+        echo -e "${YELLOW}[*] Forwarding Port Range: $port_range...${NC}"
+        lxc config device add "$vps_name" extra_ports proxy listen=tcp:0.0.0.0:$port_range connect=tcp:127.0.0.1:$port_range
+    fi
+
     echo -e "${GREEN}[+] VPS '$vps_name' created successfully! 🚀${NC}"
-    echo -e "${CYAN}>> Assigned SSH Port: $ssh_port ${NC}"
+    echo -e "${CYAN}>> Assigned SSH Port : $ssh_port ${NC}"
+    [ -n "$port_range" ] && echo -e "${CYAN}>> Forwarded Ports : $port_range ${NC}"
     pause
 }
 
@@ -133,10 +169,10 @@ manage_vps() {
     select_vps || { pause; return; }
     
     echo "1. Edit Resources (RAM/CPU/SSD)"
-    echo "2. Setup/Reset Termius SSH (Generates New Port)"
+    echo "2. Setup/Reset Termius SSH & Add/Change Port Range"
     echo "3. Start VPS"
     echo "4. Stop VPS"
-    echo -e "${RED}5. Reinstall VPS (Wipe Data, Keep Same Port/Resources)${NC}"
+    echo -e "${RED}5. Reinstall VPS (Wipe Data, Keep Same Port/Resources/Nesting)${NC}"
     read -p "Select option [1-5]: " mng_opt
 
     if [ "$mng_opt" == "1" ]; then
@@ -154,8 +190,15 @@ manage_vps() {
         
     elif [ "$mng_opt" == "2" ]; then
         read -p "Enter Root Password: " root_pass
-        echo -e "${YELLOW}[*] Configuring SSH...${NC}"
-        ssh_port=$(generate_random_port)
+        read -p "Enter Custom SSH Port (Leave blank for random): " custom_port
+        read -p "Enter Extra Port Range to Forward (e.g., 14000-14100, or leave blank): " port_range
+        echo -e "${YELLOW}[*] Configuring SSH & Ports...${NC}"
+        
+        if [ -z "$custom_port" ]; then
+            ssh_port=$(generate_random_port)
+        else
+            ssh_port=$custom_port
+        fi
         
         lxc exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
         lxc exec "$SELECTED_VPS" -- rm -f /etc/ssh/sshd_config.d/*.conf
@@ -166,7 +209,13 @@ manage_vps() {
         
         lxc config device add "$SELECTED_VPS" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22 2>/dev/null || lxc config device set "$SELECTED_VPS" ssh_proxy listen=tcp:0.0.0.0:$ssh_port
         
-        echo -e "${GREEN}[+] Termius SSH configured! New Port: $ssh_port ${NC}"
+        if [ -n "$port_range" ]; then
+            lxc config device add "$SELECTED_VPS" extra_ports proxy listen=tcp:0.0.0.0:$port_range connect=tcp:127.0.0.1:$port_range 2>/dev/null || lxc config device set "$SELECTED_VPS" extra_ports listen=tcp:0.0.0.0:$port_range connect=tcp:127.0.0.1:$port_range
+        fi
+        
+        echo -e "${GREEN}[+] Termius SSH & Ports configured successfully!${NC}"
+        echo -e "${CYAN}>> SSH Port : $ssh_port ${NC}"
+        [ -n "$port_range" ] && echo -e "${CYAN}>> Port Range : $port_range ${NC}"
         
     elif [ "$mng_opt" == "3" ]; then
         echo -e "${YELLOW}[*] Starting '$SELECTED_VPS'...${NC}"
@@ -184,10 +233,14 @@ manage_vps() {
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             read -p "Enter NEW Root Password for the reinstalled VPS: " root_pass
             
+            # Fetch current settings to restore later
             curr_ram=$(lxc config get "$SELECTED_VPS" limits.memory 2>/dev/null)
             curr_cpu=$(lxc config get "$SELECTED_VPS" limits.cpu 2>/dev/null)
             curr_disk=$(lxc config device get "$SELECTED_VPS" root size 2>/dev/null)
+            curr_nest=$(lxc config get "$SELECTED_VPS" security.nesting 2>/dev/null)
+            curr_priv=$(lxc config get "$SELECTED_VPS" security.privileged 2>/dev/null)
             curr_port=$(lxc config device get "$SELECTED_VPS" ssh_proxy listen 2>/dev/null | awk -F: '{print $NF}')
+            curr_range=$(lxc config device get "$SELECTED_VPS" extra_ports listen 2>/dev/null | awk -F: '{print $NF}')
             if [ -z "$curr_port" ]; then curr_port=$(generate_random_port); fi
             
             echo -e "${YELLOW}[*] Stopping and deleting old VPS...${NC}"
@@ -195,7 +248,15 @@ manage_vps() {
             lxc delete "$SELECTED_VPS" 2>/dev/null
             
             echo -e "${YELLOW}[*] Launching fresh Ubuntu 22.04...${NC}"
-            lxc launch ubuntu:22.04 "$SELECTED_VPS"
+            cmd=(lxc launch ubuntu:22.04 "$SELECTED_VPS")
+            [ "$curr_nest" == "true" ] && cmd+=(-c security.nesting=true)
+            [ "$curr_priv" == "true" ] && cmd+=(-c security.privileged=true)
+            
+            if ! "${cmd[@]}"; then
+                echo -e "${RED}[!] Critical Error: Failed to reinstall VPS! Please check LXD storage pool.${NC}"
+                pause
+                return
+            fi
             
             echo -e "${YELLOW}[*] Restoring previous resources...${NC}"
             [ -n "$curr_ram" ] && lxc config set "$SELECTED_VPS" limits.memory "$curr_ram"
@@ -205,9 +266,7 @@ manage_vps() {
             echo -e "${YELLOW}[*] Configuring SSH & Removing UI Prompts...${NC}"
             sleep 3
             
-            # 1. Disable needrestart pink screen
             lxc exec "$SELECTED_VPS" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
-            # 2. Silence dpkg config file conflicts (fixes the sshd_config pink screen)
             lxc exec "$SELECTED_VPS" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
             
             lxc exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
@@ -218,9 +277,13 @@ manage_vps() {
             lxc exec "$SELECTED_VPS" -- systemctl restart ssh
             
             lxc config device add "$SELECTED_VPS" ssh_proxy proxy listen=tcp:0.0.0.0:$curr_port connect=tcp:127.0.0.1:22
+            if [ -n "$curr_range" ]; then
+                lxc config device add "$SELECTED_VPS" extra_ports proxy listen=tcp:0.0.0.0:$curr_range connect=tcp:127.0.0.1:$curr_range
+            fi
             
             echo -e "${GREEN}[+] Reinstall complete! VPS is fresh and ready.${NC}"
-            echo -e "${CYAN}>> SSH Port (Restored): $curr_port ${NC}"
+            echo -e "${CYAN}>> SSH Port (Restored) : $curr_port ${NC}"
+            [ -n "$curr_range" ] && echo -e "${CYAN}>> Port Range (Restored): $curr_range ${NC}"
         else
             echo -e "${YELLOW}[-] Reinstall cancelled.${NC}"
         fi
@@ -242,13 +305,15 @@ connect_vps() {
     if [ "$conn_opt" == "1" ]; then
         host_ip=$(curl -s ifconfig.me || echo "YOUR_SERVER_IP")
         ssh_port=$(lxc config device get "$SELECTED_VPS" ssh_proxy listen 2>/dev/null | awk -F: '{print $NF}')
+        extra_ports=$(lxc config device get "$SELECTED_VPS" extra_ports listen 2>/dev/null | awk -F: '{print $NF}')
         
         echo -e "\n${GREEN}=== Termius Connection Details ===${NC}"
-        echo -e "Host IP  : ${CYAN}$host_ip${NC}"
+        echo -e "Host IP     : ${CYAN}$host_ip${NC}"
         if [ -n "$ssh_port" ]; then
-            echo -e "Port     : ${CYAN}$ssh_port${NC}"
-            echo -e "Username : ${CYAN}root${NC}"
-            echo -e "Password : ${CYAN}(The password you set)${NC}"
+            echo -e "SSH Port    : ${CYAN}$ssh_port${NC}"
+            [ -n "$extra_ports" ] && echo -e "Port Range  : ${CYAN}$extra_ports${NC}"
+            echo -e "Username    : ${CYAN}root${NC}"
+            echo -e "Password    : ${CYAN}(The password you set)${NC}"
         else
             echo -e "${RED}[!] SSH Port not found! Use Manage -> Option 2 to setup SSH first.${NC}"
         fi
