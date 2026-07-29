@@ -56,25 +56,35 @@ generate_random_port() {
     done
 }
 
-# 1. SETUP FUNCTION
+# 1. SETUP FUNCTION (FULLY UPDATED FOR FRESH INSTALL)
 setup_env() {
-    echo -e "${YELLOW}[*] Setting up LXC/LXD Environment...${NC}"
+    echo -e "${CYAN}--- Setting up Complete LXC Environment ---${NC}"
+    
+    # Step 1: Install LXD if not present
     if ! command -v lxd &> /dev/null; then
-        echo -e "${RED}[-] LXD not found. Installing LXD via snap...${NC}"
-        apt update && apt install -y snapd
+        echo -e "${YELLOW}[*] Installing LXD via snap...${NC}"
+        apt-get update -y > /dev/null 2>&1
+        apt-get install -y snapd > /dev/null 2>&1
         snap install lxd
-        lxd init --auto
-        echo -e "${GREEN}[+] LXD installed and initialized successfully!${NC}"
+        echo -e "${GREEN}[+] LXD Installed!${NC}"
     else
-        echo -e "${GREEN}[+] LXD is already installed and ready!${NC}"
+        echo -e "${GREEN}[+] LXD is already installed.${NC}"
     fi
 
-    echo -e "${YELLOW}[*] Configuring Storage Pool & Root Device (Fixing 'Storage pool not found')...${NC}"
-    # Force create a dir-based storage pool named 'default' if it doesn't exist
-    lxc storage create default dir 2>/dev/null
-    # Attach it to the default profile
-    lxc profile device add default root disk path=/ pool=default 2>/dev/null
+    # Step 2: Initialize LXD
+    echo -e "${YELLOW}[*] Initializing LXD...${NC}"
+    lxd init --auto 2>/dev/null
 
+    # Step 3: FIX STORAGE POOL FOREVER
+    echo -e "${YELLOW}[*] Configuring Storage Pool & Root Device...${NC}"
+    # Remove any broken root device from default profile
+    lxc profile device remove default root 2>/dev/null
+    # Create a fresh directory-backed pool named 'vpspool'
+    lxc storage create vpspool dir 2>/dev/null
+    # Attach 'vpspool' to the default profile
+    lxc profile device add default root disk path=/ pool=vpspool 2>/dev/null
+
+    # Step 4: Networking & Firewall
     echo -e "${YELLOW}[*] Applying Internet/Firewall forwarding rules...${NC}"
     iptables -I FORWARD -i lxdbr0 -j ACCEPT 2>/dev/null
     iptables -I FORWARD -o lxdbr0 -j ACCEPT 2>/dev/null
@@ -82,7 +92,7 @@ setup_env() {
     sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw 2>/dev/null
     ufw reload >/dev/null 2>&1
     
-    echo -e "${GREEN}[+] Network & Storage configured for seamless performance!${NC}"
+    echo -e "${GREEN}[+] Environment Setup Complete! Your server is 100% ready.${NC}"
     pause
 }
 
@@ -106,7 +116,6 @@ create_vps() {
         return
     fi
 
-    # Determine SSH Port
     if [ -z "$custom_port" ]; then
         ssh_port=$(generate_random_port)
     else
@@ -115,18 +124,15 @@ create_vps() {
 
     echo -e "${YELLOW}[*] Launching Ubuntu 22.04 container...${NC}"
     
-    # Launch with or without Privileged/Nesting mode + Error Checking
     if [[ "$opt_priv" =~ ^[Yy]$ ]]; then
         if ! lxc launch ubuntu:22.04 "$vps_name" -c security.privileged=true -c security.nesting=true; then
-            echo -e "${RED}[!] Critical Error: Failed to create VPS! Please check LXD storage pool.${NC}"
-            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first to fix storage issues.${NC}"
+            echo -e "${RED}[!] Critical Error: Failed to create VPS! Please run 'Setup Environment' (Option 1) first.${NC}"
             pause
             return
         fi
     else
         if ! lxc launch ubuntu:22.04 "$vps_name"; then
-            echo -e "${RED}[!] Critical Error: Failed to create VPS! Please check LXD storage pool.${NC}"
-            echo -e "${YELLOW}Hint: Run 'Setup Environment' (Option 1) first to fix storage issues.${NC}"
+            echo -e "${RED}[!] Critical Error: Failed to create VPS! Please run 'Setup Environment' (Option 1) first.${NC}"
             pause
             return
         fi
@@ -140,7 +146,6 @@ create_vps() {
     echo -e "${YELLOW}[*] Setting up SSH & Removing Annoying UI Prompts...${NC}"
     sleep 3 
     
-    # Disable prompts
     lxc exec "$vps_name" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
     lxc exec "$vps_name" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
     
@@ -151,10 +156,8 @@ create_vps() {
     lxc exec "$vps_name" -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
     lxc exec "$vps_name" -- systemctl restart ssh
 
-    # Add SSH Proxy Port
     lxc config device add "$vps_name" ssh_proxy proxy listen=tcp:0.0.0.0:$ssh_port connect=tcp:127.0.0.1:22
 
-    # Add Extra Port Range if specified
     if [ -n "$port_range" ]; then
         echo -e "${YELLOW}[*] Forwarding Port Range: $port_range...${NC}"
         lxc config device add "$vps_name" extra_ports proxy listen=tcp:0.0.0.0:$port_range connect=tcp:127.0.0.1:$port_range
@@ -236,7 +239,6 @@ manage_vps() {
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             read -p "Enter NEW Root Password for the reinstalled VPS: " root_pass
             
-            # Fetch current settings to restore later
             curr_ram=$(lxc config get "$SELECTED_VPS" limits.memory 2>/dev/null)
             curr_cpu=$(lxc config get "$SELECTED_VPS" limits.cpu 2>/dev/null)
             curr_disk=$(lxc config device get "$SELECTED_VPS" root size 2>/dev/null)
@@ -353,7 +355,7 @@ while true; do
     echo "  ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝    "
     echo -e "${CYAN}        L X C   V P S   M A N A G E R        ${NC}"
     echo -e "${YELLOW}=============================================${NC}"
-    echo -e "  ${GREEN}1.${NC} Setup Environment"
+    echo -e "  ${GREEN}1.${NC} Setup Environment (Run First on Fresh Server)"
     echo -e "  ${GREEN}2.${NC} Create VPS"
     echo -e "  ${GREEN}3.${NC} Manage VPS (Start/Stop/Reinstall/Edit)"
     echo -e "  ${GREEN}4.${NC} Connect VPS (Terminal / Termius Info)"
