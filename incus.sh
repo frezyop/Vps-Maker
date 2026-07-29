@@ -56,11 +56,10 @@ generate_random_port() {
     done
 }
 
-# 1. SETUP FUNCTION (UPDATED FOR INCUS)
+# 1. SETUP FUNCTION
 setup_env() {
     echo -e "${CYAN}--- Setting up Complete Incus Environment ---${NC}"
     
-    # Step 1: Install Incus via Zabbly Repo
     if ! command -v incus &> /dev/null; then
         echo -e "${YELLOW}[*] Installing Incus...${NC}"
         apt-get update -y > /dev/null 2>&1
@@ -83,21 +82,18 @@ EOF'
         echo -e "${GREEN}[+] Incus is already installed.${NC}"
     fi
 
-    # Step 2: Initialize Incus
     echo -e "${YELLOW}[*] Initializing Incus...${NC}"
     incus admin init --auto 2>/dev/null
 
-    # Step 3: FIX STORAGE POOL
     echo -e "${YELLOW}[*] Configuring Storage Pool & Root Device...${NC}"
     incus profile device remove default root 2>/dev/null
     incus storage create vpspool dir 2>/dev/null
     incus profile device add default root disk path=/ pool=vpspool 2>/dev/null
 
-    # Step 4: Networking & Firewall
     echo -e "${YELLOW}[*] Applying Internet/Firewall forwarding rules...${NC}"
     iptables -I FORWARD -i incusbr0 -j ACCEPT 2>/dev/null
     iptables -I FORWARD -o incusbr0 -j ACCEPT 2>/dev/null
-    incus network set incusbr0 ipv4.nat true 2>/dev/null
+    incus network set incusbr0 ipv4.nat=true 2>/dev/null
     sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw 2>/dev/null
     ufw reload >/dev/null 2>&1
     
@@ -148,16 +144,23 @@ create_vps() {
     fi
 
     echo -e "${YELLOW}[*] Configuring resources...${NC}"
-    incus config set "$vps_name" limits.memory "${ram_gb}GB"
-    incus config set "$vps_name" limits.cpu "$cpu_cores"
+    # FIXED SYNTAX TO AVOID WARNINGS
+    incus config set "$vps_name" limits.memory="${ram_gb}GB"
+    incus config set "$vps_name" limits.cpu="$cpu_cores"
     incus config device override "$vps_name" root size="${disk_gb}GB"
 
-    echo -e "${YELLOW}[*] Setting up SSH & Removing Annoying UI Prompts...${NC}"
-    sleep 3 
+    echo -e "${YELLOW}[*] Setting up Network & Installing SSH Server...${NC}"
+    sleep 5 
     
+    # INSTALL OPENSSH-SERVER BECAUSE INCUS MINIMAL IMAGE LACKS IT
+    incus exec "$vps_name" -- bash -c "apt-get update >/dev/null 2>&1"
+    incus exec "$vps_name" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1"
+    
+    echo -e "${YELLOW}[*] Applying SSH Configs & Removing Annoying UI Prompts...${NC}"
     incus exec "$vps_name" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
     incus exec "$vps_name" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
     
+    incus exec "$vps_name" -- mkdir -p /etc/ssh/sshd_config.d
     incus exec "$vps_name" -- bash -c "echo 'root:$root_pass' | chpasswd"
     incus exec "$vps_name" -- rm -f /etc/ssh/sshd_config.d/*.conf
     incus exec "$vps_name" -- bash -c "echo -e 'PasswordAuthentication yes\nPermitRootLogin yes' > /etc/ssh/sshd_config.d/99-custom.conf"
@@ -196,8 +199,9 @@ manage_vps() {
         read -p "Enter new CPU Cores: " new_cpu
         read -p "Enter new SSD in GB: " new_disk
         
-        if [ -n "$new_ram" ]; then incus config set "$SELECTED_VPS" limits.memory "${new_ram}GB"; fi
-        if [ -n "$new_cpu" ]; then incus config set "$SELECTED_VPS" limits.cpu "$new_cpu"; fi
+        # FIXED SYNTAX
+        if [ -n "$new_ram" ]; then incus config set "$SELECTED_VPS" limits.memory="${new_ram}GB"; fi
+        if [ -n "$new_cpu" ]; then incus config set "$SELECTED_VPS" limits.cpu="$new_cpu"; fi
         if [ -n "$new_disk" ]; then
             incus config device set "$SELECTED_VPS" root size="${new_disk}GB" 2>/dev/null || incus config device override "$SELECTED_VPS" root size="${new_disk}GB"
         fi
@@ -215,6 +219,8 @@ manage_vps() {
             ssh_port=$custom_port
         fi
         
+        incus exec "$SELECTED_VPS" -- bash -c "apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1"
+        incus exec "$SELECTED_VPS" -- mkdir -p /etc/ssh/sshd_config.d
         incus exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
         incus exec "$SELECTED_VPS" -- rm -f /etc/ssh/sshd_config.d/*.conf
         incus exec "$SELECTED_VPS" -- bash -c "echo -e 'PasswordAuthentication yes\nPermitRootLogin yes' > /etc/ssh/sshd_config.d/99-custom.conf"
@@ -273,16 +279,18 @@ manage_vps() {
             fi
             
             echo -e "${YELLOW}[*] Restoring previous resources...${NC}"
-            [ -n "$curr_ram" ] && incus config set "$SELECTED_VPS" limits.memory "$curr_ram"
-            [ -n "$curr_cpu" ] && incus config set "$SELECTED_VPS" limits.cpu "$curr_cpu"
+            [ -n "$curr_ram" ] && incus config set "$SELECTED_VPS" limits.memory="$curr_ram"
+            [ -n "$curr_cpu" ] && incus config set "$SELECTED_VPS" limits.cpu="$curr_cpu"
             [ -n "$curr_disk" ] && incus config device override "$SELECTED_VPS" root size="$curr_disk"
             
             echo -e "${YELLOW}[*] Configuring SSH & Removing UI Prompts...${NC}"
-            sleep 3
+            sleep 5
+            incus exec "$SELECTED_VPS" -- bash -c "apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1"
             
             incus exec "$SELECTED_VPS" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart > /dev/null 2>&1"
             incus exec "$SELECTED_VPS" -- bash -c 'echo "Dpkg::Options { \"--force-confdef\"; \"--force-confold\"; }" > /etc/apt/apt.conf.d/99-force-confold'
             
+            incus exec "$SELECTED_VPS" -- mkdir -p /etc/ssh/sshd_config.d
             incus exec "$SELECTED_VPS" -- bash -c "echo 'root:$root_pass' | chpasswd"
             incus exec "$SELECTED_VPS" -- rm -f /etc/ssh/sshd_config.d/*.conf
             incus exec "$SELECTED_VPS" -- bash -c "echo -e 'PasswordAuthentication yes\nPermitRootLogin yes' > /etc/ssh/sshd_config.d/99-custom.conf"
@@ -383,4 +391,3 @@ while true; do
         *) echo -e "${RED}Invalid choice! Please select 1-6.${NC}"; sleep 2 ;;
     esac
 done
-
